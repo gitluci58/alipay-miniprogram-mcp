@@ -52,6 +52,20 @@ export function buildTools(ctx) {
     }
   }
 
+  async function saveQrImageResponse(url, name) {
+    const response = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+    if (!response.ok) throw new Error(`获取二维码图片失败: HTTP ${response.status}`);
+    const image = Buffer.from(await response.arrayBuffer());
+    if (!image.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex'))) {
+      throw new Error('二维码图片不是有效的 PNG');
+    }
+    const dir = path.join(dataDir, 'qr');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${name}-${crypto.randomBytes(2).toString('hex')}.png`);
+    fs.writeFileSync(file, image);
+    return file;
+  }
+
   /** 把 worker 事件接入日志存储（按 sessionId 去重登记） */
   worker.onEvent((name, data) => {
     switch (name) {
@@ -264,7 +278,7 @@ export function buildTools(ctx) {
       const project = resolveProject(args.project);
       try {
         const r = await worker.call('preview.run', { ...args, project });
-        const qrFile = await saveQrImage(r.qrcodeUrl, 'preview');
+        const qrFile = await saveQrImageResponse(r.qrcodeUrl, 'preview');
         return ok({
           ok: true, summary: `预览已生成（版本 ${r.version ?? '-'}），请用支付宝扫码`,
           qrcodeUrl: r.qrcodeUrl, qrImageFile: qrFile, version: r.version,
@@ -290,15 +304,24 @@ export function buildTools(ctx) {
     async (args) => {
       const project = resolveProject(args.project);
       const sessionId = sessions.create('remote-debug', { summary: `真机调试 ${args.appId}` });
+      let started = false;
       try {
         const r = await worker.call('remoteDebug.start', { ...args, project, sessionId });
+        started = true;
         sessions.set(sessionId, { debugUrl: r.debugUrl, qrcodeUrl: r.qrcodeUrl });
-        const qrFile = await saveQrImage(r.qrcodeUrl, 'rdebug');
+        const qrFile = await saveQrImageResponse(r.qrcodeUrl, 'rdebug');
         return ok({
           ok: true, summary: `真机调试已就绪，调试地址: ${r.debugUrl}`,
           sessionId, qrcodeUrl: r.qrcodeUrl, qrImageFile: qrFile, debugUrl: r.debugUrl, version: r.version,
         });
       } catch (e) {
+        if (started) {
+          try {
+            await worker.call('remoteDebug.stop', { sessionId });
+          } catch (stopError) {
+            return fail(`真机调试发起失败: ${e.message}；停止服务失败: ${stopError.message}`, { sessionId });
+          }
+        }
         sessions.delete(sessionId);
         return fail(`真机调试发起失败: ${e.message}`);
       }
@@ -589,7 +612,7 @@ export function buildTools(ctx) {
             page: c.page, pageQuery: c.query || undefined,
             skipBuild: true,
           });
-          const qrFile = await saveQrImage(r.qrcodeUrl, `case-${results.length + 1}`);
+          const qrFile = await saveQrImageResponse(r.qrcodeUrl, `case-${results.length + 1}`);
           results.push({ ...c, ok: true, qrcodeUrl: r.qrcodeUrl, qrImageFile: qrFile });
         } catch (e) {
           results.push({ ...c, ok: false, error: e.message });
